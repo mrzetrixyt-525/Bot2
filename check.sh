@@ -287,6 +287,65 @@ if envtext.count('KVM_NETWORK_MODE=')!=1 or (envtest.stat().st_mode & 0o777)!=0o
     raise SystemExit('[FAIL] Remote env-writer failed duplicate cleanup or mode-0600 protection')
 print('[PASS] Remote env writer: credentials enforced, custom network preserved, defaults filled, file mode 0600')
 print('[PASS] Deployment progress is persistent; node API keys are DM-only and terminal input can be hidden')
+# Credential/tunnel endpoints must never fall back to channel posts when DMs are closed.
+def func_source(name):
+    node=next((x for x in tree.body if isinstance(x,(ast.FunctionDef,ast.AsyncFunctionDef)) and x.name==name),None)
+    if node is None: raise SystemExit('[FAIL] Critical command handler missing: '+name)
+    return ast.get_source_segment(bot,node) or ''
+for name in ('ssh_command','sshx_command','pinggy_command'):
+    source=func_source(name)
+    if 'except discord.Forbidden:' not in source or 'ctx.send(embed=access)' in source or 'ctx.send(embed=e)' in source:
+        raise SystemExit('[FAIL] '+name+' may publicly reveal SSH credentials/tunnel endpoints when DMs are blocked')
+password_source=func_source('vps_password')
+if 'await recipient.send(' not in password_source or 'await ctx.send(embed=embed)' in password_source:
+    raise SystemExit('[FAIL] VPS root passwords are not guaranteed to be DM-only')
+for unsafe in ('Password report was posted publicly', 'await ctx.send(embed=access)'):
+    if unsafe in password_source: raise SystemExit('[FAIL] VPS password command contains an unsafe channel delivery path')
+status_source=func_source('system_status')
+if 'BOT_PROCESS_STARTED_MONOTONIC' not in status_source or 'datetime.fromtimestamp(start_time - bot.latency)' in status_source:
+    raise SystemExit('[FAIL] System status bot-uptime calculation is not based on process uptime')
+health_source=func_source('sshx_health_command')
+if 'await ctx.author.send(embed=embed' not in health_source or 'await ctx.send(embed=embed)' in health_source:
+    raise SystemExit('[FAIL] SSHX diagnostics/session URL may be posted into a public channel')
+manage_source=func_source('manage_vps')
+manage_view_source='\n'.join((bot.split('    async def _pinggy_block(',1)[1].split('    async def create_vps_embed(',1)[0], bot.split('    async def create_vps_embed(',1)[1].split('    async def ',1)[0])) if '    async def _pinggy_block(' in bot and '    async def create_vps_embed(' in bot else ''
+if not manage_source or not manage_view_source:
+    raise SystemExit('[FAIL] VPS management dashboard safety paths could not be checked')
+for unsafe in ('SSHX: <{sshx_url}>', 'Last session: <{sshx_url}>', 'ssh root@{host}', 'Host: `{host}`', 'Port: `{port}`'):
+    if unsafe in manage_view_source:
+        raise SystemExit('[FAIL] VPS management dashboard exposes a private tunnel endpoint: '+unsafe)
+error_source=func_source('on_command_error')
+if 'detail[:800]' in error_source or '**Technical:**' in error_source or 'Sensitive technical details are hidden.' not in error_source:
+    raise SystemExit('[FAIL] Command errors may broadcast raw exception details into Discord/audit channels')
+for name in ('ssh_command','sshx_command','pinggy_command'):
+    source=func_source(name)
+    if 'str(e)[:900]' in source or 'exc_info=True' in source or 'Session URL' in source and 'not posted' not in source:
+        raise SystemExit('[FAIL] '+name+' may expose private exception or session details')
+if 'session URL omitted from logs' not in bot or 'endpoint omitted from logs' not in bot:
+    raise SystemExit('[FAIL] Background tunnel supervisors still log live connection endpoints')
+exec_source=func_source('execute_command')
+if 'await ctx.author.send(embed=embed' not in exec_source or 'await ctx.send(embed=embed)' in exec_source or 'Command: `{command}`' in exec_source:
+    raise SystemExit('[FAIL] Remote command output/text is not restricted to the admin DM')
+if 'def safe_error_summary(' not in bot or 'Sensitive details were hidden' not in bot:
+    raise SystemExit('[FAIL] Safe exception summarizer is missing')
+for command_name in ('deploy_command','create_machine'):
+    command_node=next((n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name==command_name),None)
+    command_source=ast.get_source_segment(bot,command_node) if command_node else ''
+    if not command_source or r'\\n' in command_source:
+        raise SystemExit('[FAIL] '+command_name+' description may render literal \\n instead of real line breaks')
+if "env_set BOT_VERSION '15.3.3 VPS KVM Security + Reliability Fixes'" not in (bot_path.parent/'setup.sh').read_text(encoding='utf-8'):
+    raise SystemExit('[FAIL] Setup does not update release metadata when preserving existing .env configuration')
+raw_error=re.compile(r'(?:str\(\s*(?:e|exc|error|db_error|start_error|rollback_error)\s*\)|\{\s*(?:e|exc|error|db_error|start_error|rollback_error)\s*(?:![a-zA-Z]|:[^}]*)?\})')
+for call in ast.walk(tree):
+    if not isinstance(call,ast.Call): continue
+    fn=call.func
+    attr=fn.attr if isinstance(fn,ast.Attribute) else ''
+    name=fn.id if isinstance(fn,ast.Name) else ''
+    if attr in ('send','send_message') or name in ('add_field','create_error_embed','create_warning_embed'):
+        snippet=ast.get_source_segment(bot,call) or ''
+        if raw_error.search(snippet):
+            raise SystemExit('[FAIL] Raw exception text may reach a Discord-facing message/embed near line '+str(call.lineno))
+print('[PASS] SSH/SSHX/Pinggy/password reports are private; exec output is DM-only; dashboard hides tunnel endpoints; Discord errors are redacted; uptime is monotonic; branding normalized')
 (tmp/'vpsctl.py').write_bytes(controller)
 (tmp/'node-agent.py').write_bytes(agent)
 PYSTATIC
@@ -329,6 +388,27 @@ class VpsCtlTests(unittest.TestCase):
   with patch.object(vpsctl,'PUBLIC_POOL','8.8.8.0/29'),patch.object(vpsctl,'PUBLIC_GATEWAY','8.8.8.1'):
    (vpsctl.META_DIR/'existing.json').write_text('{"name":"existing","public_ipv4":"8.8.8.2"}',encoding='utf-8')
    self.assertEqual(vpsctl.allocate_public_ipv4('new-vm'),'8.8.8.3')
+ def test_image_download_retries_tls_handshake_timeouts(self):
+  from urllib.error import URLError
+  attempts={'count':0}
+  class FakeResponse:
+   def __init__(self): self.remaining=2*1024*1024+1
+   def __enter__(self): return self
+   def __exit__(self,*_args): return False
+   def read(self,size):
+    if self.remaining<=0: return b''
+    count=min(size,self.remaining); self.remaining-=count; return b'X'*count
+  def fake_urlopen(_request,timeout):
+   self.assertEqual(timeout,180)
+   attempts['count']+=1
+   if attempts['count']<3: raise URLError('simulated TLS handshake timeout')
+   return FakeResponse()
+  with patch.object(vpsctl,'urlopen',side_effect=fake_urlopen),patch.object(vpsctl.time,'sleep') as sleeper:
+   result=vpsctl.download_image('ubuntu:24.04')
+  self.assertEqual(attempts['count'],3)
+  self.assertGreater(result.stat().st_size,2*1024*1024)
+  self.assertFalse(result.with_suffix('.download').exists())
+  self.assertEqual(sleeper.call_count,2)
  def test_seed_iso_is_rebuilt_after_retry(self):
   marker={'value':b'A'}
   def fake_run(argv,**_kwargs):

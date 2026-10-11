@@ -3,7 +3,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-# RGNODES™™ compact installer. Uses the bundle's existing .env safely (never `source`s it),
+# RGNODES™ compact installer. Uses the bundle's existing .env safely (never `source`s it),
 # installs the KVM/QEMU stack expected by bot.py, and keeps runtime state outside the code tree.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_DIR="$(cd -- "${RGNODES_SOURCE_DIR:-$SCRIPT_DIR}" && pwd -P)"
@@ -23,7 +23,7 @@ else
   RED=''; GRN=''; YEL=''; BLU=''; MAG=''; CYN=''; WHT=''; DIM=''; NC=''
 fi
 
-log(){ printf '%b[RGNODES™™]%b %s\n' "$CYN" "$NC" "$*"; }
+log(){ printf '%b[RGNODES™]%b %s\n' "$CYN" "$NC" "$*"; }
 step(){ printf '%b[+]%b %s\n' "$GRN" "$NC" "$*"; }
 warn(){ printf '%b[!]%b %s\n' "$YEL" "$NC" "$*" >&2; }
 die(){ printf '%b[x]%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
@@ -44,7 +44,7 @@ banner(){
   if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]] && command -v clear >/dev/null 2>&1; then clear || true; fi
   printf '\n%b╔══════════════════════════════════════════════════════════════╗%b\n' "$CYN" "$NC"
   printf '%b║                                                              ║%b\n' "$CYN" "$NC"
-  rainbow_line '                    >>> RGNODES™™ <<<'
+  rainbow_line '                    >>> RGNODES™ <<<'
   printf '%b║                 VPS CONTROL PLATFORM                        ║%b\n' "$CYN" "$NC"
   printf '%b║                   Power By RGNODES™                         ║%b\n' "$CYN" "$NC"
   printf '%b║                                                              ║%b\n' "$CYN" "$NC"
@@ -371,6 +371,8 @@ finally:
  except FileNotFoundError: pass
 PYSET
 }
+# Refresh release metadata only; keep the operator's token, IDs and feature settings intact.
+env_set BOT_VERSION '15.3.3 VPS KVM Security + Reliability Fixes'
 
 # Interactive first run: token prompt is hidden. Non-interactive setup leaves blank keys unchanged.
 if [[ -t 0 && -r /dev/tty ]]; then
@@ -442,11 +444,11 @@ FAIL2BAN_CONFIG_ENABLED="$(config_get HOST_FAIL2BAN_SSH_ENABLED "$ENV_FILE")"
 case "${FAIL2BAN_CONFIG_ENABLED,,}" in ''|1|true|yes|on) FAIL2BAN_CONFIG_ENABLED=true;; *) FAIL2BAN_CONFIG_ENABLED=false;; esac
 if [[ "$FAIL2BAN_CONFIG_ENABLED" == true ]]; then
   if command -v fail2ban-client >/dev/null 2>&1; then
-    if [[ ! -e "$FAIL2BAN_JAIL_FILE" || "$(grep -Fxc '# Managed by RGNODES™™ setup.sh; SSH brute-force protection only.' "$FAIL2BAN_JAIL_FILE" 2>/dev/null || true)" == 1 ]]; then
+    if [[ ! -e "$FAIL2BAN_JAIL_FILE" || "$(grep -Ec '^# Managed by RGNODES(™™|™) setup\.sh; SSH brute-force protection only\.$' "$FAIL2BAN_JAIL_FILE" 2>/dev/null || true)" == 1 ]]; then
       install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
       JAIL_TMP="$(mktemp "$(dirname "$FAIL2BAN_JAIL_FILE")/.rgnodes-sshd.XXXXXX")"
       cat > "$JAIL_TMP" <<'FAIL2BANJAIL'
-# Managed by RGNODES™™ setup.sh; SSH brute-force protection only.
+# Managed by RGNODES™ setup.sh; SSH brute-force protection only.
 [sshd]
 enabled = true
 backend = systemd
@@ -526,7 +528,7 @@ for unit in libvirtd.service virtqemud.service virtlogd.service virtlockd.servic
 UNIT_TMP="$(mktemp /etc/systemd/system/.${SERVICE_NAME}.XXXXXX)"
 cat > "$UNIT_TMP" <<EOFUNIT
 [Unit]
-Description=RGNODES™™ VPS Bot - KVM/QEMU/libvirt
+Description=RGNODES™ VPS Bot - KVM/QEMU/libvirt
 Wants=network-online.target
 After=network-online.target
 

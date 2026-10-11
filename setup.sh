@@ -144,6 +144,7 @@ STATE_ROOT="${ENV_STATE_ROOT:-/var/lib/rgnodes-vps}"
 ENV_DATA_DIR="${RGNODES_DATA_DIR:-$(config_get RGNODES_DATA_DIR)}"
 DATA_DIR="${ENV_DATA_DIR:-$STATE_ROOT/data}"
 BACKUP_ROOT="${RGNODES_BACKUP_ROOT:-/var/backups/rgnodes-vps}"
+FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/99-rgnodes-sshd.local"
 
 [[ "$APP_DIR" == /* ]] || die 'RGNODES_APP_DIR must resolve to an absolute path.'
 [[ "$STATE_ROOT" == /* && "$DATA_DIR" == /* && "$BACKUP_ROOT" == /* ]] || die 'App, data and backup directories must be absolute paths.'
@@ -211,6 +212,13 @@ restore_previous(){
   elif [[ -f "$BACKUP_DIR/.absent-bot.service" ]]; then rm -f -- "/etc/systemd/system/$SERVICE_NAME"; fi
   if [[ -f "$BACKUP_DIR/vpsctl-bin" ]]; then install -m 0755 "$BACKUP_DIR/vpsctl-bin" /usr/local/sbin/vpsctl
   elif [[ -f "$BACKUP_DIR/.absent-vpsctl-bin" ]]; then rm -f /usr/local/sbin/vpsctl; fi
+  if [[ -f "$BACKUP_DIR/fail2ban-sshd.local" ]]; then
+    install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
+    cp -p -- "$BACKUP_DIR/fail2ban-sshd.local" "$FAIL2BAN_JAIL_FILE"
+  elif [[ -f "$BACKUP_DIR/.absent-fail2ban-sshd.local" ]]; then rm -f -- "$FAIL2BAN_JAIL_FILE"; fi
+  if command -v fail2ban-client >/dev/null 2>&1 && systemctl is-active --quiet fail2ban 2>/dev/null; then
+    fail2ban-client -t >/dev/null 2>&1 && systemctl restart fail2ban >/dev/null 2>&1 || true
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   if (( WAS_ENABLED )); then systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true; else systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
   if (( WAS_ACTIVE )); then systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
@@ -225,6 +233,7 @@ for f in "${CODE_FILES[@]}"; do
 done
 if [[ -f "/etc/systemd/system/$SERVICE_NAME" ]]; then cp -p "/etc/systemd/system/$SERVICE_NAME" "$BACKUP_DIR/bot.service"; else : > "$BACKUP_DIR/.absent-bot.service"; fi
 if [[ -f /usr/local/sbin/vpsctl ]]; then cp -p /usr/local/sbin/vpsctl "$BACKUP_DIR/vpsctl-bin"; else : > "$BACKUP_DIR/.absent-vpsctl-bin"; fi
+if [[ -f "$FAIL2BAN_JAIL_FILE" ]]; then cp -p -- "$FAIL2BAN_JAIL_FILE" "$BACKUP_DIR/fail2ban-sshd.local"; else : > "$BACKUP_DIR/.absent-fail2ban-sshd.local"; fi
 
 # Preserve database using SQLite's online backup API; original DB/WAL/SHM stay in place.
 LIVE_DB=''
@@ -323,7 +332,7 @@ if [[ "$MODE" != "--code-only" ]]; then
   apt-get update
   apt-get install -y python3 python3-venv python3-pip python3-dev build-essential libffi-dev pkg-config \
     ca-certificates curl wget openssl sqlite3 acl openssh-server openssh-client sshpass iproute2 \
-    iputils-ping procps util-linux nftables dnsutils qemu-kvm qemu-utils qemu-guest-agent \
+    iputils-ping procps util-linux nftables dnsutils fail2ban python3-systemd qemu-kvm qemu-utils qemu-guest-agent \
     libvirt-daemon-system libvirt-clients libvirt-daemon-driver-qemu libvirt-daemon-config-network \
     cloud-image-utils genisoimage
 fi
@@ -354,6 +363,45 @@ if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then python3 -m venv "$APP_DIR/.venv"
 
 # All inputs are validated and package installation is complete. From here, rollback is armed.
 ROLLBACK_ARMED=1
+FAIL2BAN_CONFIG_ENABLED="$(config_get HOST_FAIL2BAN_SSH_ENABLED "$ENV_FILE")"
+case "${FAIL2BAN_CONFIG_ENABLED,,}" in ''|1|true|yes|on) FAIL2BAN_CONFIG_ENABLED=true;; *) FAIL2BAN_CONFIG_ENABLED=false;; esac
+if [[ "$FAIL2BAN_CONFIG_ENABLED" == true ]]; then
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    if [[ ! -e "$FAIL2BAN_JAIL_FILE" || "$(grep -Fxc '# Managed by RGNODES™™ setup.sh; SSH brute-force protection only.' "$FAIL2BAN_JAIL_FILE" 2>/dev/null || true)" == 1 ]]; then
+      install -d -m 0755 "$(dirname "$FAIL2BAN_JAIL_FILE")"
+      JAIL_TMP="$(mktemp "$(dirname "$FAIL2BAN_JAIL_FILE")/.rgnodes-sshd.XXXXXX")"
+      cat > "$JAIL_TMP" <<'FAIL2BANJAIL'
+# Managed by RGNODES™™ setup.sh; SSH brute-force protection only.
+[sshd]
+enabled = true
+backend = systemd
+port = ssh
+maxretry = 5
+findtime = 10m
+bantime = 1h
+FAIL2BANJAIL
+      chown root:root "$JAIL_TMP"; chmod 0644 "$JAIL_TMP"; mv -f -- "$JAIL_TMP" "$FAIL2BAN_JAIL_FILE"
+      step 'Configured a bounded Fail2ban SSH jail (5 retries / 10-minute window / 1-hour ban).'
+    else
+      warn 'A non-RGNODES Fail2ban jail file already exists at the managed path; preserved it rather than overwriting custom policy.'
+    fi
+    if fail2ban-client -t >/dev/null 2>&1; then
+      systemctl enable fail2ban >/dev/null
+      systemctl restart fail2ban
+      if fail2ban-client status sshd >/dev/null 2>&1; then
+        step 'Fail2ban SSH jail is active; existing UFW/provider firewall and SSH authentication settings were not changed.'
+      else
+        warn 'Fail2ban service is active but the sshd jail is not confirmed. Review /etc/fail2ban and run fail2ban-client status.'
+      fi
+    else
+      die 'Fail2ban configuration test failed; rollback will restore the previous jail configuration.'
+    fi
+  else
+    warn 'Fail2ban is unavailable (most likely --code-only mode without the package). Install fail2ban to enable SSH brute-force protection.'
+  fi
+else
+  log 'HOST_FAIL2BAN_SSH_ENABLED is disabled in .env; no Fail2ban policy was added.'
+fi
 if (( WAS_ACTIVE )); then log "Stopping $SERVICE_NAME for a source-safe update."; systemctl stop "$SERVICE_NAME"; fi
 for f in "${CODE_FILES[@]}"; do
   chmod 0755 "$STAGE_DIR/$f" 2>/dev/null || true

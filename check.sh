@@ -65,10 +65,114 @@ if 'if key in forced: value=forced[key]' not in node and 'if key in forced: valu
     raise SystemExit('[FAIL] Remote installer no longer enforces credentials or preserves defaults safely')
 print('[PASS] KVM, public-IP, API-key authentication, command allowlist and network defaults present')
 functions={n.name for n in ast.walk(tree) if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
-required={'init_db','create_port_forward','remove_port_forward','recreate_port_forwards','ensure_docker_ready','get_sshx_session_info','get_pinggy_session_info','apply_guest_motd','build_rgnodes_motd_profile_script','deploy_command','resize_vps','send_progress','_find_kvm_vpsctl'}
+classes={n.name for n in ast.walk(tree) if isinstance(n,ast.ClassDef)}
+if 'MonitoringDashboardView' not in classes: raise SystemExit('[FAIL] Live monitoring dashboard view class is missing')
+required={'init_db','create_port_forward','remove_port_forward','recreate_port_forwards','ensure_docker_ready','get_sshx_session_info','get_pinggy_session_info','apply_guest_motd','build_rgnodes_motd_profile_script','deploy_command','resize_vps','send_progress','_find_kvm_vpsctl','_make_discord_user_agent','build_monitoring_dashboard_embed','monitoring_dashboard'}
 missing=required-functions
 if missing: raise SystemExit('[FAIL] Critical bot functions missing: '+', '.join(sorted(missing)))
 print('[PASS] Required DB, VPS, port, tunnel, access, deployment and embedded-controller functions present')
+# Verify the Discord REST User-Agent is ASCII even with a Unicode-branded BOT_NAME.
+ua_fn=next((n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_make_discord_user_agent'),None)
+if ua_fn is None: raise SystemExit('[FAIL] ASCII-safe Discord User-Agent helper missing')
+ua_ns={'re':re}
+exec(compile(ast.Module(body=[ua_fn],type_ignores=[]),'bot.py#user-agent','exec'),ua_ns)
+for name in ('RGNODES™','RGNODES™™','名称™',''):
+    ua=ua_ns['_make_discord_user_agent'](name,'15.3.0 VPS KVM')
+    if not ua.isascii() or any(ord(ch)>127 for ch in ua): raise SystemExit('[FAIL] Discord User-Agent contains non-ASCII characters')
+if 'RGNODES' not in ua_ns['_make_discord_user_agent']('RGNODES™','15.3.0'):
+    raise SystemExit('[FAIL] ASCII User-Agent fallback is not branded')
+# Run the actual preflight function with a mocked HTTP client to ensure the Unicode-branded
+# BOT_NAME can never leak a non-ASCII character into a request header or crash startup.
+preflight_fn=next((n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='discord_token_preflight'),None)
+if preflight_fn is None: raise SystemExit('[FAIL] Discord token preflight function missing')
+seen={}
+class _FakeRequestException(Exception): pass
+class _FakeResponse:
+    def __init__(self,status): self.status_code=status
+class _FakeRequests:
+    RequestException=_FakeRequestException
+    status=200
+    @classmethod
+    def get(cls,url,headers,timeout):
+        seen.update({'url':url,'headers':dict(headers),'timeout':timeout})
+        for value in headers.values():
+            if not str(value).isascii(): raise UnicodeEncodeError('latin-1',str(value),0,1,'test')
+        return _FakeResponse(cls.status)
+class _FakeLogger:
+    def info(self,*a,**k): pass
+    def warning(self,*a,**k): pass
+    def error(self,*a,**k): pass
+preflight_ns={'requests':_FakeRequests,'logger':_FakeLogger(),'BOT_NAME':'RGNODES™','BOT_VERSION':'15.3.0','_make_discord_user_agent':ua_ns['_make_discord_user_agent']}
+exec(compile(ast.Module(body=[preflight_fn],type_ignores=[]),'bot.py#preflight','exec'),preflight_ns)
+if not preflight_ns['discord_token_preflight']('A'*64) or not seen.get('headers',{}).get('User-Agent','').isascii():
+    raise SystemExit('[FAIL] Unicode brand can still crash Discord token preflight')
+_FakeRequests.status=401
+if preflight_ns['discord_token_preflight']('A'*64):
+    raise SystemExit('[FAIL] HTTP 401 is not treated as an invalid token')
+print('[PASS] Discord preflight simulated against Unicode ™ branding and HTTP 401/200 responses')
+# Validate the pure parts of dashboard formatting with representative and failure values.
+helper_names={'_dashboard_valid_global_ipv4','_dashboard_progress','_dashboard_uptime'}
+helper_nodes=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in helper_names]
+if {n.name for n in helper_nodes} != helper_names: raise SystemExit('[FAIL] Dashboard validation/format helper missing')
+dash_ns={'Optional':__import__('typing').Optional,'create_progress_bar':lambda v: f'BAR:{v}'}
+exec(compile(ast.Module(body=helper_nodes,type_ignores=[]),'bot.py#dashboard-helpers','exec'),dash_ns)
+if not dash_ns['_dashboard_valid_global_ipv4']('1.1.1.1') or dash_ns['_dashboard_valid_global_ipv4']('192.168.1.1') or dash_ns['_dashboard_valid_global_ipv4']('224.0.0.1'):
+    raise SystemExit('[FAIL] Dashboard public IPv4 validator accepts a non-global address')
+if dash_ns['_dashboard_progress'](None) != '`unavailable`' or dash_ns['_dashboard_uptime'](90061) != '1d 01h 01m':
+    raise SystemExit('[FAIL] Dashboard unavailable metrics / uptime formatting regression')
+print('[PASS] Dashboard IPv4 validation, missing-metric fallback and uptime formatting')
+# Execute the real dashboard embed builder against deterministic fake host probes, without
+# importing discord.py or making any network/host changes.
+build_fn=next((n for n in tree.body if isinstance(n,ast.AsyncFunctionDef) and n.name=='build_monitoring_dashboard_embed'),None)
+if build_fn is None: raise SystemExit('[FAIL] Live monitoring dashboard renderer missing')
+class _TestEmbed:
+    def __init__(self,title='',description=''): self.title=title; self.description=description; self.fields=[]
+    def set_author(self,**kwargs): self.author=kwargs
+    def set_footer(self,**kwargs): self.footer=kwargs
+    def add_field(self,**kwargs): self.fields.append(kwargs)
+class _TestBot:
+    latency=0.025
+    def is_ready(self): return True
+class _TestDiscord:
+    Embed=_TestEmbed
+class _TestLogger:
+    def debug(self,*a,**k): pass
+samples={'cpu':22.0,'ram_pct':41.0,'ram_used_gb':4.1,'ram_total_gb':10.0,'disk_pct':55.0,'disk_used_gb':55.0,'disk_total_gb':100.0,'uptime_seconds':90061,'load1':0.4,'cpu_count':4,'net_rx_mb':123.0,'net_tx_mb':456.0,'interfaces_up':['ens3']}
+services_sample={'kvm_device':True,'libvirt_ok':True,'libvirt_detail':'qemu:///system responding','docker_ok':True,'docker_detail':'daemon online · 27.1','ufw_state':'inactive','fail2ban_state':'active · sshd jail active','uplink':'ens3','bridge':'not configured','network_mode':'direct'}
+async def _test_public_ip(): return '1.1.1.1','auto-detected host egress'
+ns={'discord':_TestDiscord,'asyncio':__import__('asyncio'),'Dict':__import__('typing').Dict,'Any':__import__('typing').Any,'Optional':__import__('typing').Optional,
+    'logger':_TestLogger(),'_collect_dashboard_host_metrics':lambda:samples,'_collect_dashboard_services':lambda:services_sample,
+    'get_nodes':lambda:[{'id':1,'name':'local','is_local':True,'url':'','api_key':'','total_vps':10}],
+    'vps_data':{'123':[{'status':'running','suspended':False},{'status':'stopped','suspended':False},{'status':'running','suspended':True}]},
+    '_dashboard_public_ipv4':_test_public_ip,'_DASHBOARD_FRAMES':('◐','◓','◑','◒'),'_dashboard_uptime':dash_ns['_dashboard_uptime'],
+    '_dashboard_progress':dash_ns['_dashboard_progress'],'create_progress_bar':lambda v:f'BAR:{v}','create_embed':lambda title,description:_TestEmbed(title,description),
+    'add_field':lambda embed,name,value,inline=False:embed.add_field(name=name,value=value,inline=inline),
+    'truncate_text':lambda text,length=1024:str(text)[:length],'PUBLIC_IPV4_POOL_CIDR':'8.8.8.0/29','PUBLIC_IPV4_REQUIRED':True,
+    'KVM_NETWORK_MODE':'direct','PUBLIC_PARENT_INTERFACE':'ens3','PUBLIC_BRIDGE_NAME':'','ANTI_MINING_ENABLED':True,
+    'HOST_CPU_MAX_DEPLOY_PCT':85.0,'HOST_RAM_RESERVE_GB':2.0,'HOST_DISK_RESERVE_GB':10.0,'BOT_ICON_URL':'',
+    'bot':_TestBot(),'datetime':__import__('datetime').datetime,'time':__import__('time'),'BOT_NAME':'RGNODES™','BOT_VERSION':'15.3.0'}
+# add_field is a local helper in bot.py and sees the same embed interface above.
+exec(compile(ast.Module(body=[build_fn],type_ignores=[]),'bot.py#dashboard-renderer','exec'),ns)
+embed=__import__('asyncio').run(ns['build_monitoring_dashboard_embed'](2))
+joined=' '.join(str(f.get('name',''))+' '+str(f.get('value','')) for f in embed.fields)
+if len(embed.fields)<6 or '1.1.1.1' not in joined or 'active · sshd jail active' not in joined or '3' not in joined:
+    raise SystemExit('[FAIL] Live dashboard failed to render required host/network/security/VPS sections')
+print('[PASS] Live dashboard embed rendered deterministically with metrics, host egress IP, protection and VPS state')
+# All registered bot commands must be classic prefix commands; no slash/hybrid decorators.
+if any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr in {'hybrid_command','hybrid_group'} for n in ast.walk(tree)):
+    raise SystemExit('[FAIL] Hybrid/slash command decorator found; release policy is prefix-only')
+if not any(isinstance(n,ast.AsyncFunctionDef) and n.name=='monitoring_dashboard' for n in tree.body):
+    raise SystemExit('[FAIL] Prefix monitoring dashboard command missing')
+print('[PASS] Prefix-only command policy and live monitoring dashboard present')
+setup_text=(bot_path.parent/'setup.sh').read_text(encoding='utf-8')
+env_text=(bot_path.parent/'.env').read_text(encoding='utf-8')
+if 'HOST_FAIL2BAN_SSH_ENABLED=true' not in env_text or 'fail2ban' not in setup_text.lower() or 'backend = systemd' not in setup_text or 'maxretry = 5' not in setup_text:
+    raise SystemExit('[FAIL] Optional main-host SSH Fail2ban hardening flow is incomplete')
+if 'ufw enable' in setup_text.lower() or 'sshd_config' in setup_text:
+    raise SystemExit('[FAIL] Setup unexpectedly changes UFW/SSH daemon policy and could lock out the operator')
+if 'fail2ban-sshd.local' not in setup_text or '.absent-fail2ban-sshd.local' not in setup_text:
+    raise SystemExit('[FAIL] Fail2ban jail backup/rollback flow is missing')
+print('[PASS] Main-host SSH brute-force protection has opt-out, validation and rollback; UFW/sshd policies stay untouched')
 # Exercise the pure MOTD builder without importing/running the Discord bot. Include hostile
 # shell metacharacters to prove user-configured text is base64-encoded, not executed.
 fn=next((n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='build_rgnodes_motd_profile_script'),None)

@@ -56,9 +56,10 @@ banner(){
 
 usage(){
   cat <<'USAGE'
-Usage: sudo bash setup.sh [install|--code-only|--check|--help]
+Usage: sudo bash setup.sh [install|--code-only|--repair-controller|--check|--help]
   install      Install host dependencies, deploy/update the bot, and configure systemd.
   --code-only  Skip apt package installation; all host prerequisites must already exist.
+  --repair-controller  Re-extract, hash-verify and atomically repair /usr/local/sbin/vpsctl only.
   --check      Run the bundle's static validation and regression tests without host changes.
   --help       Show this help.
 USAGE
@@ -89,11 +90,13 @@ if [[ "$MODE" == "--check" ]]; then
   [[ -s "$SOURCE_DIR/check.sh" ]] || die 'check.sh is missing.'
   exec bash "$SOURCE_DIR/check.sh" --static
 fi
-[[ "$MODE" == "install" || "$MODE" == "--code-only" ]] || { usage >&2; die "Unknown mode: $MODE"; }
+[[ "$MODE" == "install" || "$MODE" == "--code-only" || "$MODE" == "--repair-controller" ]] || { usage >&2; die "Unknown mode: $MODE"; }
 if (( BANNER_SHOWN == 0 )); then banner; fi
 [[ $EUID -eq 0 ]] || die 'Run as root: sudo bash setup.sh'
-command -v systemctl >/dev/null 2>&1 || die 'systemd/systemctl is required. Generic CodeSandbox/container shells are not suitable for the KVM host installer.'
-if [[ "$MODE" != "--code-only" ]]; then
+if [[ "$MODE" != "--repair-controller" ]]; then
+  command -v systemctl >/dev/null 2>&1 || die 'systemd/systemctl is required. Generic CodeSandbox/container shells are not suitable for the KVM host installer.'
+fi
+if [[ "$MODE" == "install" ]]; then
   command -v apt-get >/dev/null 2>&1 || die 'apt-get is required; use --code-only only when system prerequisites are already installed.'
   [[ -r /etc/os-release ]] || die 'Cannot identify the operating system from /etc/os-release.'
   . /etc/os-release
@@ -183,6 +186,78 @@ if not all(s in payloads['node agent'].decode() for s in ('X-API-Key','def build
     raise SystemExit('embedded node agent security/interface markers mismatch')
 print('Bundle validation passed: bot.py, embedded KVM controller, node agent and hashes are consistent.')
 PYVERIFY
+
+# Dedicated controller repair path. This is useful when an older install or a directory/symlink
+# at /usr/local/sbin/vpsctl prevents the bot from finding the trusted KVM controller. It does not
+# reinstall packages, replace .env, or touch VM disks/database.
+if [[ "$MODE" == "--repair-controller" ]]; then
+  REPAIR_TARGET=/usr/local/sbin/vpsctl
+  REPAIR_DIR="$(dirname -- "$REPAIR_TARGET")"
+  REPAIR_STAMP="$(date +%Y%m%d-%H%M%S)-$$"
+  REPAIR_TMP="$REPAIR_DIR/.vpsctl.rgnodes-repair-$REPAIR_STAMP"
+  REPAIR_BACKUP=''
+  install -d -m 0755 "$REPAIR_DIR"
+  cleanup_repair(){ [[ -z "$REPAIR_TMP" || ! -e "$REPAIR_TMP" ]] || rm -f -- "$REPAIR_TMP"; }
+  trap cleanup_repair EXIT
+  python3 - "$SOURCE_DIR/bot.py" "$REPAIR_TMP" <<'PYREPAIR'
+import base64, hashlib, os, re, sys, zlib
+from pathlib import Path
+bot_path, out_path = map(Path, sys.argv[1:])
+s = bot_path.read_text(encoding='utf-8')
+p = re.search(r"_EMBEDDED_VPSCTL_ZLIB_B64\s*=\s*(['\"])(.*?)\1", s, re.S)
+h = re.search(r"_EMBEDDED_VPSCTL_SHA256\s*=\s*['\"]([0-9a-f]{64})['\"]", s)
+if not p or not h:
+    raise SystemExit('Embedded controller payload/hash is missing from bot.py; use a matching complete release ZIP.')
+try:
+    payload = zlib.decompress(base64.b64decode(p.group(2), validate=True))
+except Exception as e:
+    raise SystemExit(f'Embedded controller payload is corrupt: {type(e).__name__}')
+if hashlib.sha256(payload).hexdigest() != h.group(1):
+    raise SystemExit('Embedded controller SHA-256 does not match the bot release.')
+text = payload.decode('utf-8')
+if not all(marker in text for marker in ('KVM/QEMU/libvirt only', 'def compat(', 'virsh')):
+    raise SystemExit('Controller payload does not match the required KVM backend.')
+compile(text, str(out_path), 'exec')
+out_path.write_bytes(payload)
+os.chmod(out_path, 0o755)
+print('Extracted controller SHA-256:', hashlib.sha256(payload).hexdigest())
+PYREPAIR
+  chown root:root "$REPAIR_TMP"
+  chmod 0755 "$REPAIR_TMP"
+  if [[ -e "$REPAIR_TARGET" || -L "$REPAIR_TARGET" ]]; then
+    REPAIR_BACKUP="${REPAIR_TARGET}.legacy-${REPAIR_STAMP}"
+    if [[ -e "$REPAIR_BACKUP" || -L "$REPAIR_BACKUP" ]]; then die "Refusing to overwrite existing backup path: $REPAIR_BACKUP"; fi
+    mv -T -- "$REPAIR_TARGET" "$REPAIR_BACKUP" || die "Could not preserve the existing controller path: $REPAIR_TARGET"
+  fi
+  if ! mv -T -- "$REPAIR_TMP" "$REPAIR_TARGET"; then
+    if [[ -n "$REPAIR_BACKUP" && ( -e "$REPAIR_BACKUP" || -L "$REPAIR_BACKUP" ) ]]; then mv -T -- "$REPAIR_BACKUP" "$REPAIR_TARGET" || true; fi
+    die 'Could not atomically install the KVM controller; old path was restored where possible.'
+  fi
+  REPAIR_TMP=''
+  if ! python3 - "$SOURCE_DIR/bot.py" "$REPAIR_TARGET" <<'PYVERIFYCTL'
+import hashlib, os, re, sys
+from pathlib import Path
+bot_path, ctl_path = map(Path, sys.argv[1:])
+s = bot_path.read_text(encoding='utf-8')
+h = re.search(r"_EMBEDDED_VPSCTL_SHA256\s*=\s*['\"]([0-9a-f]{64})['\"]", s)
+data = ctl_path.read_bytes()
+text = data.decode('utf-8', errors='replace')
+if not h or hashlib.sha256(data).hexdigest() != h.group(1): raise SystemExit('Installed controller SHA-256 mismatch.')
+if not all(x in text for x in ('KVM/QEMU/libvirt only', 'def compat(', 'virsh')): raise SystemExit('Installed controller markers mismatch.')
+if not os.access(ctl_path, os.X_OK): raise SystemExit('Installed controller is not executable.')
+compile(data.decode('utf-8'), str(ctl_path), 'exec')
+print('Installed controller verified:', ctl_path, hashlib.sha256(data).hexdigest())
+PYVERIFYCTL
+  then
+    rm -f -- "$REPAIR_TARGET"
+    if [[ -n "$REPAIR_BACKUP" && ( -e "$REPAIR_BACKUP" || -L "$REPAIR_BACKUP" ) ]]; then mv -T -- "$REPAIR_BACKUP" "$REPAIR_TARGET" || true; fi
+    die 'Post-install controller verification failed; previous path restored where possible.'
+  fi
+  log "Hash-verified KVM controller repaired at $REPAIR_TARGET."
+  [[ -z "$REPAIR_BACKUP" ]] || log "Previous controller preserved at $REPAIR_BACKUP."
+  log 'Restart the bot with: systemctl restart bot'
+  exit 0
+fi
 
 mkdir -p "$APP_DIR"
 APP_DIR="$(cd -- "$APP_DIR" && pwd -P)"
@@ -413,7 +488,27 @@ done
 install -d -m 0755 /usr/local/sbin
 CTL_TMP="/usr/local/sbin/.vpsctl.rgnodes-$STAMP"
 install -o root -g root -m 0755 "$STAGE_DIR/vpsctl-bin" "$CTL_TMP"
-mv -f -- "$CTL_TMP" /usr/local/sbin/vpsctl
+# A stale path might be a directory or symlink, not just an old regular file. Preserve such
+# an object before replacing it; `mv -T` prevents silently moving the controller inside a dir.
+if [[ -d /usr/local/sbin/vpsctl && ! -L /usr/local/sbin/vpsctl ]]; then
+  mv -T -- /usr/local/sbin/vpsctl "/usr/local/sbin/vpsctl.legacy-dir-$STAMP" || die 'Could not preserve an unexpected directory at /usr/local/sbin/vpsctl.'
+  warn "Preserved unexpected controller directory at /usr/local/sbin/vpsctl.legacy-dir-$STAMP."
+fi
+mv -fT -- "$CTL_TMP" /usr/local/sbin/vpsctl
+python3 - "$APP_DIR/bot.py" /usr/local/sbin/vpsctl <<'PYPOSTCTL'
+import hashlib, os, re, sys
+from pathlib import Path
+bot_path, ctl_path = map(Path, sys.argv[1:])
+s = bot_path.read_text(encoding='utf-8')
+h = re.search(r"_EMBEDDED_VPSCTL_SHA256\s*=\s*['"]([0-9a-f]{64})['"]", s)
+data = ctl_path.read_bytes()
+text = data.decode('utf-8', errors='replace')
+if not h or hashlib.sha256(data).hexdigest() != h.group(1): raise SystemExit('Installed KVM controller hash does not match bot.py.')
+if not all(x in text for x in ('KVM/QEMU/libvirt only', 'def compat(', 'virsh')): raise SystemExit('Installed KVM controller markers do not match.')
+if not os.access(ctl_path, os.X_OK): raise SystemExit('Installed KVM controller is not executable.')
+compile(data.decode('utf-8'), str(ctl_path), 'exec')
+print('Installed controller verified:', ctl_path, hashlib.sha256(data).hexdigest())
+PYPOSTCTL
 
 install -d -m 0755 "$STATE_ROOT" "$STATE_ROOT/images" "$STATE_ROOT/disks" "$STATE_ROOT/seeds" "$STATE_ROOT/meta" "$STATE_ROOT/secrets" "$APP_DIR/db_backups" "$APP_DIR/vps_backups"
 chmod 0700 "$STATE_ROOT/secrets"

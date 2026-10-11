@@ -116,7 +116,7 @@ AUDIT_NOISY_COMMANDS = {
     'ping', 'help', 'quickhelp', 'commands', 'stats', 'info', 'uptime',
 }
 LOG_CHANNEL_SNAPSHOT_LINES = max(8, min(30, env_int('LOG_CHANNEL_SNAPSHOT_LINES', '16')))
-BOT_VERSION = os.getenv('BOT_VERSION', '15.3.0 VPS KVM Live Dashboard')
+BOT_VERSION = os.getenv('BOT_VERSION', '15.3.1 VPS KVM Live Dashboard')
 BOT_DEVELOPER = os.getenv('BOT_DEVELOPER', 'RGNODES™')
 BOT_THUMBNAIL_URL = os.getenv('BOT_THUMBNAIL_URL', 'https://cdn.discordapp.com/icons/1503614184477167616/f1534b0b4cb22ff19872549b8a52d59f.webp?size=2048')
 BOT_ICON_URL = os.getenv('BOT_ICON_URL', 'https://cdn.discordapp.com/icons/1503614184477167616/f1534b0b4cb22ff19872549b8a52d59f.webp?size=2048')
@@ -207,7 +207,7 @@ def _is_kvm_vpsctl(path: str) -> bool:
     """Accept only the exact integrity-checked KVM controller bundled with this bot."""
     try:
         payload = Path(path).read_bytes()
-        text = payload[:12000].decode('utf-8', errors='replace')
+        text = payload.decode('utf-8', errors='replace')
         return (
             all(marker in text for marker in KVM_CONTROLLER_MARKERS)
             and hashlib.sha256(payload).hexdigest() == _EMBEDDED_VPSCTL_SHA256
@@ -4507,7 +4507,7 @@ async def execute_vpsctl_compat(container_name: str, command: str, timeout: int 
     controller = _find_kvm_vpsctl()
     if node.get('is_local'):
         if not controller:
-            raise RuntimeError('KVM controller executable is missing or invalid. Run `sudo bash setup.sh` to install the hash-verified embedded controller; an old LXC/LXD controller is intentionally rejected.')
+            raise RuntimeError('KVM controller executable is missing or invalid. Run `sudo bash setup.sh --repair-controller` from the matching seven-file release directory (or `sudo bash setup.sh` for a full install). The installer verifies the embedded SHA-256 and preserves the old controller; legacy LXC/LXD controllers are intentionally rejected.')
         argv = [sys.executable, controller, 'compat', command]
         try:
             proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

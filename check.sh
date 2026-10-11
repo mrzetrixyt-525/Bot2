@@ -7,6 +7,9 @@ umask 077
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${RGNODES_APP_DIR:-$SCRIPT_DIR}"
 MODE="${1:-all}"
+# Some controller regression fixtures invoke terminal helpers; keep checks deterministic in CI
+# and non-interactive SSH sessions where TERM is not exported.
+export TERM="${TERM:-dumb}"
 PASS=0; WARN=0; FAIL=0
 pass(){ printf '[PASS] %s\n' "$*"; PASS=$((PASS+1)); }
 warn(){ printf '[WARN] %s\n' "$*"; WARN=$((WARN+1)); }
@@ -20,6 +23,13 @@ done
 for f in setup.sh check.sh node.sh; do
   if bash -n "$APP_DIR/$f"; then pass "Shell syntax: $f"; else fail "Shell syntax: $f"; fi
 done
+if grep -Fq -- '--repair-controller' "$APP_DIR/setup.sh" \
+  && grep -Fq 'Installed controller verified:' "$APP_DIR/setup.sh" \
+  && grep -Fq 'mv -fT -- "$CTL_TMP" /usr/local/sbin/vpsctl' "$APP_DIR/setup.sh"; then
+  pass 'KVM controller repair/install is hash-verified, atomic and directory-safe'
+else
+  fail 'KVM controller repair/install lacks safe atomic verification'
+fi
 if command -v node >/dev/null 2>&1; then
   if node --check "$APP_DIR/ecosystem.config.js" >/dev/null 2>&1; then pass 'JavaScript syntax: ecosystem.config.js'; else fail 'JavaScript syntax: ecosystem.config.js'; fi
 else warn 'Node.js is unavailable; ecosystem.config.js syntax check skipped.'; fi
@@ -57,6 +67,25 @@ print('[PASS] Main and remote-node controllers are byte-for-byte identical')
 text=controller.decode('utf-8')
 if not all(x in text for x in ('KVM/QEMU/libvirt only','def compat(','virsh','is_real_public_ipv4','allocate_public_ipv4')):
     raise SystemExit('[FAIL] KVM/public-IP safety markers missing from embedded controller')
+if text.index('def compat(') < 12000:
+    raise SystemExit('[FAIL] Regression fixture no longer places the compat marker beyond the historical scan boundary')
+find_fn=next((n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_is_kvm_vpsctl'),None)
+if find_fn is None:
+    raise SystemExit('[FAIL] KVM controller file validator missing')
+fn_src=ast.get_source_segment(bot,find_fn) or ''
+if 'payload[:12000]' in fn_src:
+    raise SystemExit('[FAIL] KVM controller validator still truncates marker scan at 12,000 bytes')
+digest_match=re.search(r"_EMBEDDED_VPSCTL_SHA256\s*=\s*['\"]([0-9a-f]{64})['\"]",bot)
+if not digest_match: raise SystemExit('[FAIL] Embedded controller digest constant is missing')
+ns={'Path':Path,'hashlib':hashlib,'KVM_CONTROLLER_MARKERS':('KVM/QEMU/libvirt only','def compat(','virsh'),'_EMBEDDED_VPSCTL_SHA256':digest_match.group(1)}
+exec(compile(ast.Module(body=[find_fn],type_ignores=[]),'bot.py#_is_kvm_vpsctl','exec'),ns)
+ctl_fixture=tmp/'controller-validator-fixture'; ctl_fixture.write_bytes(controller); ctl_fixture.chmod(0o755)
+if not ns['_is_kvm_vpsctl'](str(ctl_fixture)):
+    raise SystemExit('[FAIL] Valid embedded KVM controller is rejected by the runtime validator')
+ctl_fixture.write_bytes(controller+b'\n#tamper')
+if ns['_is_kvm_vpsctl'](str(ctl_fixture)):
+    raise SystemExit('[FAIL] Runtime controller validator accepted a tampered controller')
+print('[PASS] KVM controller marker validation scans the full source and checks SHA-256')
 if not all(x in agent.decode('utf-8') for x in ('X-API-Key','hmac.compare_digest','def build_vpsctl_argv','ThreadingHTTPServer')):
     raise SystemExit('[FAIL] Remote agent authentication/allowlist markers missing')
 if not all(x in node for x in ('KVM_NETWORK_MODE','PUBLIC_PARENT_INTERFACE','PUBLIC_BRIDGE_NAME','REAL_PUBLIC_IPV4_REQUIRED','PUBLIC_IPV4_POOL_CIDR','PUBLIC_IPV4_GATEWAY','PUBLIC_IPV4_DNS','RGNODES_VPS_ROOT')):

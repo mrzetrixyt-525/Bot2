@@ -65,7 +65,7 @@ node_controller=payload(node,r"^VPSCTL_ZLIB_B64='([^']+)'$",r"^VPSCTL_SHA256='([
 if controller != node_controller: raise SystemExit('[FAIL] bot.py and node.sh carry different KVM controllers')
 print('[PASS] Main and remote-node controllers are byte-for-byte identical')
 text=controller.decode('utf-8')
-if not all(x in text for x in ('KVM/QEMU/libvirt only','def compat(','virsh','is_real_public_ipv4','allocate_public_ipv4')):
+if not all(x in text for x in ('KVM/QEMU/libvirt only','def compat(','virsh','is_real_public_ipv4','allocate_public_ipv4',"if op=='health':")):
     raise SystemExit('[FAIL] KVM/public-IP safety markers missing from embedded controller')
 if text.index('def compat(') < 12000:
     raise SystemExit('[FAIL] Regression fixture no longer places the compat marker beyond the historical scan boundary')
@@ -86,8 +86,15 @@ ctl_fixture.write_bytes(controller+b'\n#tamper')
 if ns['_is_kvm_vpsctl'](str(ctl_fixture)):
     raise SystemExit('[FAIL] Runtime controller validator accepted a tampered controller')
 print('[PASS] KVM controller marker validation scans the full source and checks SHA-256')
-if not all(x in agent.decode('utf-8') for x in ('X-API-Key','hmac.compare_digest','def build_vpsctl_argv','ThreadingHTTPServer')):
+agent_text=agent.decode('utf-8')
+if not all(x in agent_text for x in ('X-API-Key','hmac.compare_digest','def build_vpsctl_argv','ThreadingHTTPServer')):
     raise SystemExit('[FAIL] Remote agent authentication/allowlist markers missing')
+if '[:12000]' in agent_text or 'payload = candidate.read_bytes()' not in agent_text or 'hashlib.sha256(payload).hexdigest()' not in agent_text:
+    raise SystemExit('[FAIL] Remote agent controller validation still truncates its source or omits integrity validation')
+agent_expected=re.search(r"EXPECTED_VPSCTL_SHA256\s*=\s*['\"]([0-9a-f]{64})['\"]",agent_text)
+if not agent_expected or agent_expected.group(1)!=hashlib.sha256(controller).hexdigest():
+    raise SystemExit('[FAIL] Remote agent trusted-controller digest does not match the embedded KVM controller')
+print('[PASS] Remote-agent root cause fixed: full-file marker scan and pinned KVM-controller SHA-256')
 if not all(x in node for x in ('KVM_NETWORK_MODE','PUBLIC_PARENT_INTERFACE','PUBLIC_BRIDGE_NAME','REAL_PUBLIC_IPV4_REQUIRED','PUBLIC_IPV4_POOL_CIDR','PUBLIC_IPV4_GATEWAY','PUBLIC_IPV4_DNS','RGNODES_VPS_ROOT')):
     raise SystemExit('[FAIL] Remote installer does not set/retain complete KVM network configuration')
 if 'if key in forced: value=forced[key]' not in node and 'if key in forced: value=forced[key]' not in node.replace('\\n','\n'):
@@ -333,7 +340,7 @@ for command_name in ('deploy_command','create_machine'):
     command_source=ast.get_source_segment(bot,command_node) if command_node else ''
     if not command_source or r'\\n' in command_source:
         raise SystemExit('[FAIL] '+command_name+' description may render literal \\n instead of real line breaks')
-if "env_set BOT_VERSION '15.3.3 VPS KVM Security + Reliability Fixes'" not in (bot_path.parent/'setup.sh').read_text(encoding='utf-8'):
+if "env_set BOT_VERSION '15.3.5 Remote-only KVM Health Fixes'" not in (bot_path.parent/'setup.sh').read_text(encoding='utf-8'):
     raise SystemExit('[FAIL] Setup does not update release metadata when preserving existing .env configuration')
 raw_error=re.compile(r'(?:str\(\s*(?:e|exc|error|db_error|start_error|rollback_error)\s*\)|\{\s*(?:e|exc|error|db_error|start_error|rollback_error)\s*(?:![a-zA-Z]|:[^}]*)?\})')
 for call in ast.walk(tree):
@@ -345,6 +352,23 @@ for call in ast.walk(tree):
         snippet=ast.get_source_segment(bot,call) or ''
         if raw_error.search(snippet):
             raise SystemExit('[FAIL] Raw exception text may reach a Discord-facing message/embed near line '+str(call.lineno))
+# New provisioning target must skip local nodes by default and prefer NODE - 1 / Singapore.
+if not all(s in bot for s in ("REMOTE_NODE_ONLY = str(os.getenv('REMOTE_NODE_ONLY', 'true'))", "if REMOTE_NODE_ONLY and bool(n.get('is_local'))", "def _preferred_deployment_node_id", "HOST_VCPU_OVERCOMMIT_RATIO")):
+    raise SystemExit('[FAIL] Remote-only default-node routing or proportional vCPU admission guard missing')
+if not all(s in (bot_path.parent/'.env').read_text(encoding='utf-8') for s in ('REMOTE_NODE_ONLY=true','PINGGY_SSH_PORT=443','PINGGY_REMOTE_PORT=890','HOST_VCPU_OVERCOMMIT_RATIO=1.5')):
+    raise SystemExit('[FAIL] Release defaults do not set remote-only mode, Pinggy ports and vCPU ratio')
+if 'for requested_port in "$REMOTE_PORT" 0' not in bot or '-R "$forward"' not in bot:
+    raise SystemExit('[FAIL] Pinggy remote port 890 request does not fall back to an auto-assigned public port')
+if 'HOST_VCPU_OVERCOMMIT_RATIO' not in controller.decode('utf-8') or 'MAX_DEPLOY_RAM_SHARE' not in controller.decode('utf-8'):
+    raise SystemExit('[FAIL] Controller-level RAM/vCPU admission guard is missing')
+print('[PASS] Remote-only node routing, Singapore preference, RAM/vCPU safety budgets and Pinggy 890/fallback behavior')
+if 'if REMOTE_NODE_ONLY and bool(node.get(\'is_local\')):' not in bot or 'REMOTE_NODE_ONLY redirected VPS operation from local node_id=' not in bot:
+    raise SystemExit('[FAIL] Remote-only mode can still execute an explicitly selected local node')
+if "health_command = f'{shlex.quote(controller_path)} compat health'" not in bot or 'Remote-only self-check failed' not in bot:
+    raise SystemExit('[FAIL] Remote-only self-check does not verify authenticated remote KVM health')
+if 'CLI-style secrets' not in bot or '--?(?:password|passwd|token|api[-_]?key|secret|authorization)' not in bot:
+    raise SystemExit('[FAIL] Diagnostic redaction omits CLI-style credential arguments')
+print('[PASS] Remote-only execution-boundary guard and CLI-secret log redaction')
 print('[PASS] SSH/SSHX/Pinggy/password reports are private; exec output is DM-only; dashboard hides tunnel endpoints; Discord errors are redacted; uptime is monotonic; branding normalized')
 (tmp/'vpsctl.py').write_bytes(controller)
 (tmp/'node-agent.py').write_bytes(agent)
@@ -388,6 +412,15 @@ class VpsCtlTests(unittest.TestCase):
   with patch.object(vpsctl,'PUBLIC_POOL','8.8.8.0/29'),patch.object(vpsctl,'PUBLIC_GATEWAY','8.8.8.1'):
    (vpsctl.META_DIR/'existing.json').write_text('{"name":"existing","public_ipv4":"8.8.8.2"}',encoding='utf-8')
    self.assertEqual(vpsctl.allocate_public_ipv4('new-vm'),'8.8.8.3')
+ def test_compat_health_uses_same_kvm_readiness_gate_as_create(self):
+  with patch.object(vpsctl,'ensure_kvm_ready') as ready, patch.object(vpsctl.Path,'exists',return_value=True), patch.object(vpsctl.shutil,'which',side_effect=lambda name:f'/usr/bin/{name}'), patch.object(vpsctl,'NETWORK_MODE','direct'), patch.object(vpsctl,'PUBLIC_POOL','8.8.8.0/29'):
+   report=vpsctl.compat('health')
+   ready.assert_called_once_with()
+   self.assertEqual(report['status'],'ok')
+   self.assertEqual(report['backend'],'KVM/QEMU/libvirt')
+   self.assertTrue(report['kvm_device']); self.assertTrue(report['public_ipv4_pool_configured'])
+  with patch.object(vpsctl,'ensure_kvm_ready',side_effect=RuntimeError('simulated /dev/kvm or public network failure')):
+   with self.assertRaisesRegex(RuntimeError,'simulated /dev/kvm'): vpsctl.compat('health')
  def test_image_download_retries_tls_handshake_timeouts(self):
   from urllib.error import URLError
   attempts={'count':0}
@@ -421,7 +454,7 @@ class VpsCtlTests(unittest.TestCase):
    marker['value']=b'B'; second=vpsctl.write_seed('retry-vm','password-two','retry-vm','52:54:00:00:00:02')
    self.assertEqual(second,iso); self.assertEqual(iso.read_bytes(),b'B'*2048); self.assertFalse(list(iso.parent.glob('.seed-*.iso')))
  def test_remote_agent_accepts_only_allowlisted_kvm_controller_command(self):
-  controller=Path(ROOT_TMP.name)/'vpsctl'; controller.write_text('#!/usr/bin/env python3\n# KVM/QEMU/libvirt only\ndef compat(command): pass\n# virsh controller marker\n',encoding='utf-8'); controller.chmod(0o755)
+  controller=Path(ROOT_TMP.name)/'vpsctl'; controller.write_bytes(Path(vpsctl.__file__).read_bytes()); controller.chmod(0o755)
   with patch.dict(os.environ,{'RGNODES_VPSCTL_PATH':str(controller)}):
    command=f"{controller} compat 'status test-vm'"; self.assertEqual(node_agent.build_vpsctl_argv(command),[str(controller),'compat','status test-vm'])
    with self.assertRaisesRegex(ValueError,'only approved'): node_agent.build_vpsctl_argv("/bin/sh -c 'id'")
@@ -453,10 +486,31 @@ if [[ "$MODE" != "--host" ]]; then
 fi
 
 if [[ "$MODE" != "--static" ]]; then
-  for bin in virsh qemu-img sshpass ssh curl; do command -v "$bin" >/dev/null 2>&1 && pass "Host command available: $bin" || warn "Host command missing: $bin"; done
-  [[ -e /dev/kvm ]] && pass '/dev/kvm exists' || warn '/dev/kvm missing: real KVM VPS deployment requires provider/nested virtualization.'
-  if command -v virsh >/dev/null 2>&1 && virsh -c qemu:///system list --all >/dev/null 2>&1; then pass 'libvirt qemu:///system responds'; else warn 'libvirt qemu:///system is not ready.'; fi
   [[ -s "$APP_DIR/.env" ]] && pass '.env present' || fail '.env missing'
+  REMOTE_ONLY='false'
+  if [[ -s "$APP_DIR/.env" ]]; then
+    REMOTE_ONLY="$(python3 - "$APP_DIR/.env" <<'PYROLE'
+import sys
+from pathlib import Path
+for line in Path(sys.argv[1]).read_text(encoding='utf-8',errors='replace').splitlines():
+ s=line.strip()
+ if s and not s.startswith('#') and '=' in s:
+  k,v=s.split('=',1)
+  if k.strip()=='REMOTE_NODE_ONLY':
+   print('true' if v.strip().strip('"\'').lower() in {'1','true','yes','on'} else 'false')
+   break
+else: print('false')
+PYROLE
+)"
+  fi
+  if [[ "$REMOTE_ONLY" == true ]]; then
+    for bin in python3 ssh curl; do command -v "$bin" >/dev/null 2>&1 && pass "Control-host command available: $bin" || warn "Control-host command missing: $bin"; done
+    pass 'Local KVM checks skipped: REMOTE_NODE_ONLY=true; run bot.py --self-check to probe the configured remote KVM node.'
+  else
+    for bin in virsh qemu-img sshpass ssh curl; do command -v "$bin" >/dev/null 2>&1 && pass "Host command available: $bin" || warn "Host command missing: $bin"; done
+    [[ -e /dev/kvm ]] && pass '/dev/kvm exists' || warn '/dev/kvm missing: real KVM VPS deployment requires provider/nested virtualization.'
+    if command -v virsh >/dev/null 2>&1 && virsh -c qemu:///system list --all >/dev/null 2>&1; then pass 'libvirt qemu:///system responds'; else warn 'libvirt qemu:///system is not ready.'; fi
+  fi
   if python3 - "$APP_DIR/.env" <<'PYENV'
 import sys
 from pathlib import Path
@@ -469,7 +523,7 @@ t=v.get('DISCORD_TOKEN','')
 raise SystemExit(0 if len(t)>=50 and not any(c.isspace() for c in t) else 1)
 PYENV
   then pass 'DISCORD_TOKEN appears configured (value not displayed)'; else warn 'DISCORD_TOKEN not configured; bot cannot login until .env is completed.'; fi
-  info 'Provider-routed IPv4, guest boot, actual SSH reachability and external tunnels require a real configured node and cannot be proven by offline self-check.'
+  info 'Provider-routed IPv4, guest boot, actual SSH reachability and external tunnels require a real configured node and cannot be proven without the authenticated remote self-check.'
 fi
 printf '\nSummary: pass=%s warn=%s fail=%s\n' "$PASS" "$WARN" "$FAIL"
 [[ $FAIL -eq 0 ]]

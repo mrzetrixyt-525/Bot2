@@ -3,8 +3,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-# RGNODES™ compact installer. Uses the bundle's existing .env safely (never `source`s it),
-# installs the KVM/QEMU stack expected by bot.py, and keeps runtime state outside the code tree.
+# RGNODES™ compact installer. Uses .env as data (never `source`s it) and preserves runtime state.
+# Remote-only mode installs KVM/QEMU on NODE - 1 via node.sh, not on the Discord control host.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_DIR="$(cd -- "${RGNODES_SOURCE_DIR:-$SCRIPT_DIR}" && pwd -P)"
 APP_DIR="${RGNODES_APP_DIR:-/root/Bot2}"
@@ -65,26 +65,9 @@ Usage: sudo bash setup.sh [install|--code-only|--repair-controller|--check|--hel
 USAGE
 }
 
-# With no explicit mode, offer a friendly menu on a real TTY. Automation remains non-interactive.
+# No mode menu: `sudo bash setup.sh` automatically detects supported Debian/Ubuntu and runs full install.
 if [[ $# -gt 1 ]]; then usage >&2; die 'Use at most one mode argument.'; fi
 if [[ $# -eq 1 && "$MODE" == "--help" ]]; then banner; usage; exit 0; fi
-if [[ $# -eq 0 && -t 0 && -r /dev/tty ]]; then
-  banner
-  printf '%b  Select setup mode%b\n' "$WHT" "$NC"
-  printf '  %b1)%b Full install/update (KVM host + bot service) [recommended]\n' "$GRN" "$NC"
-  printf '  %b2)%b Code/service update only (requires preinstalled dependencies)\n' "$GRN" "$NC"
-  printf '  %b3)%b Validate bundle only (no host changes)\n' "$GRN" "$NC"
-  printf '  %b4)%b Exit\n\n' "$GRN" "$NC"
-  printf '%bChoose [1-4]: %b' "$CYN" "$NC"
-  IFS= read -r CHOICE </dev/tty || CHOICE=4
-  case "$CHOICE" in
-    1) MODE='install' ;;
-    2) MODE='--code-only' ;;
-    3) MODE='--check' ;;
-    4) log 'Cancelled by user.'; exit 0 ;;
-    *) die 'Invalid menu choice. Run again and choose 1-4.' ;;
-  esac
-fi
 
 if [[ "$MODE" == "--check" ]]; then
   [[ -s "$SOURCE_DIR/check.sh" ]] || die 'check.sh is missing.'
@@ -372,7 +355,19 @@ finally:
 PYSET
 }
 # Refresh release metadata only; keep the operator's token, IDs and feature settings intact.
-env_set BOT_VERSION '15.3.3 VPS KVM Security + Reliability Fixes'
+env_set BOT_VERSION '15.3.5 Remote-only KVM Health Fixes'
+# Apply requested remote-only routing and repair the old Pinggy server-port default in preserved configs.
+env_set REMOTE_NODE_ONLY 'true'
+[[ -n "$(env_get DEFAULT_NODE_ID)" ]] || env_set DEFAULT_NODE_ID '0'
+env_set PINGGY_SSH_PORT '443'
+env_set PINGGY_REMOTE_PORT '890'
+[[ -n "$(env_get HOST_VCPU_OVERCOMMIT_RATIO)" ]] || env_set HOST_VCPU_OVERCOMMIT_RATIO '1.5'
+[[ -n "$(env_get MAX_DEPLOY_RAM_SHARE)" ]] || env_set MAX_DEPLOY_RAM_SHARE '0.80'
+[[ -n "$(env_get HOST_CPU_RESERVE)" ]] || env_set HOST_CPU_RESERVE '1'
+[[ -n "$(env_get HOST_RAM_RESERVE_GB)" ]] || env_set HOST_RAM_RESERVE_GB '2'
+[[ -n "$(env_get HOST_DISK_RESERVE_GB)" ]] || env_set HOST_DISK_RESERVE_GB '10'
+[[ -n "$(env_get HOST_CPU_MAX_DEPLOY_PCT)" ]] || env_set HOST_CPU_MAX_DEPLOY_PCT '85'
+[[ -n "$(env_get MIN_HOST_RAM_FREE_PCT_DEPLOY)" ]] || env_set MIN_HOST_RAM_FREE_PCT_DEPLOY '18'
 
 # Interactive first run: token prompt is hidden. Non-interactive setup leaves blank keys unchanged.
 if [[ -t 0 && -r /dev/tty ]]; then
@@ -401,17 +396,22 @@ fi
 # first-install credential is actually present in the private backup. Never expose it in logs.
 install -m 0600 "$ENV_FILE" "$DATA_DIR/env.backup"
 
-# Install named system packages; never perform a general host upgrade or auto-change networking.
+# Install named packages only. In remote-only mode, KVM is installed on NODE - 1 by node.sh,
+# not on the Discord bot's control VM; this avoids treating the control VM as an accidental node.
 if [[ "$MODE" != "--code-only" ]]; then
-  log "Installing KVM/QEMU/libvirt dependencies on ${PRETTY_NAME:-${ID:-Debian/Ubuntu}}; no LXD/LXC packages or full host upgrade will be performed."
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a APT_LISTCHANGES_FRONTEND=none
-  log 'Installing runtime and KVM packages (no apt full-upgrade; provider networking remains untouched).'
+  log "Installing runtime dependencies on ${PRETTY_NAME:-${ID:-Debian/Ubuntu}}; no host-wide upgrade or network rewrite will be performed."
   apt-get update
   apt-get install -y python3 python3-venv python3-pip python3-dev build-essential libffi-dev pkg-config \
-    ca-certificates curl wget openssl sqlite3 acl openssh-server openssh-client sshpass iproute2 \
-    iputils-ping procps util-linux nftables dnsutils fail2ban python3-systemd qemu-kvm qemu-utils qemu-guest-agent \
-    libvirt-daemon-system libvirt-clients libvirt-daemon-driver-qemu libvirt-daemon-config-network \
-    cloud-image-utils genisoimage
+    ca-certificates curl wget openssl sqlite3 acl sudo net-tools openssh-server openssh-client sshpass iproute2 \
+    iputils-ping procps util-linux nftables dnsutils fail2ban python3-systemd
+  if [[ "$(printf '%s' "$(env_get REMOTE_NODE_ONLY)" | tr '[:upper:]' '[:lower:]')" == true ]]; then
+    log 'REMOTE_NODE_ONLY=true: skipping local KVM/libvirt packages. Run node.sh on NODE - 1 (Asia/Singapore) to install the virtualization stack.'
+  else
+    apt-get install -y cpu-checker qemu-kvm qemu-utils qemu-guest-agent \
+      libvirt-daemon-system libvirt-clients libvirt-daemon-driver-qemu libvirt-daemon-config-network \
+      cloud-image-utils genisoimage
+  fi
 fi
 
 # Stage code outside the live paths and install Python dependencies into an isolated venv.
@@ -514,21 +514,29 @@ PYPOSTCTL
 
 install -d -m 0755 "$STATE_ROOT" "$STATE_ROOT/images" "$STATE_ROOT/disks" "$STATE_ROOT/seeds" "$STATE_ROOT/meta" "$STATE_ROOT/secrets" "$APP_DIR/db_backups" "$APP_DIR/vps_backups"
 chmod 0700 "$STATE_ROOT/secrets"
-QEMU_USER=''
-for candidate in libvirt-qemu qemu; do if id "$candidate" >/dev/null 2>&1; then QEMU_USER="$candidate"; break; fi; done
-if [[ -n "$QEMU_USER" ]] && command -v setfacl >/dev/null 2>&1; then
-  setfacl -m "u:$QEMU_USER:rx" "$STATE_ROOT" 2>/dev/null || true
-  for d in images disks seeds; do setfacl -m "u:$QEMU_USER:rwx" "$STATE_ROOT/$d" 2>/dev/null || true; find "$STATE_ROOT/$d" -type d -exec setfacl -m "d:u:$QEMU_USER:rwX" {} + 2>/dev/null || true; done
-else warn 'Automatic QEMU ACL setup unavailable; inspect /var/lib/rgnodes-vps permissions.'; fi
+if [[ "$(printf '%s' "$(env_get REMOTE_NODE_ONLY)" | tr '[:upper:]' '[:lower:]')" != true ]]; then
+  QEMU_USER=''
+  for candidate in libvirt-qemu qemu; do if id "$candidate" >/dev/null 2>&1; then QEMU_USER="$candidate"; break; fi; done
+  if [[ -n "$QEMU_USER" ]] && command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "u:$QEMU_USER:rx" "$STATE_ROOT" 2>/dev/null || true
+    for d in images disks seeds; do setfacl -m "u:$QEMU_USER:rwx" "$STATE_ROOT/$d" 2>/dev/null || true; find "$STATE_ROOT/$d" -type d -exec setfacl -m "d:u:$QEMU_USER:rwX" {} + 2>/dev/null || true; done
+  else warn 'Automatic QEMU ACL setup unavailable; inspect /var/lib/rgnodes-vps permissions.'; fi
+fi
 
 mkdir -p /run/sshd
 if command -v sshd >/dev/null 2>&1; then sshd -t || die 'Host sshd configuration test failed; provider SSH configuration was not overwritten.'; fi
-for unit in libvirtd.service virtqemud.service virtlogd.service virtlockd.service ssh.service; do systemctl enable "$unit" >/dev/null 2>&1 || true; systemctl start "$unit" >/dev/null 2>&1 || true; done
+if [[ "$(printf '%s' "$(env_get REMOTE_NODE_ONLY)" | tr '[:upper:]' '[:lower:]')" == true ]]; then
+  systemctl enable ssh.service >/dev/null 2>&1 || true
+  systemctl start ssh.service >/dev/null 2>&1 || true
+  log 'Remote-only mode: local libvirt services were intentionally not enabled or started.'
+else
+  for unit in libvirtd.service virtqemud.service virtlogd.service virtlockd.service ssh.service; do systemctl enable "$unit" >/dev/null 2>&1 || true; systemctl start "$unit" >/dev/null 2>&1 || true; done
+fi
 
 UNIT_TMP="$(mktemp /etc/systemd/system/.${SERVICE_NAME}.XXXXXX)"
 cat > "$UNIT_TMP" <<EOFUNIT
 [Unit]
-Description=RGNODES™ VPS Bot - KVM/QEMU/libvirt
+Description=RGNODES™ VPS Bot - Remote-node KVM/QEMU Controller
 Wants=network-online.target
 After=network-online.target
 
@@ -585,8 +593,12 @@ else
   log "Service $SERVICE_NAME is active."
 fi
 
-if [[ ! -e /dev/kvm ]]; then warn '/dev/kvm is missing: the Discord bot can run, but real KVM VPS deployment requires provider/nested virtualization.'; fi
-if ! virsh -c qemu:///system list --all >/dev/null 2>&1; then warn 'libvirt qemu:///system is not ready; run sudo bash check.sh for diagnostics.'; fi
+if [[ "$(printf '%s' "$(env_get REMOTE_NODE_ONLY)" | tr '[:upper:]' '[:lower:]')" != true ]]; then
+  if [[ ! -e /dev/kvm ]]; then warn '/dev/kvm is missing: real local KVM VPS deployment requires provider/nested virtualization.'; fi
+  if ! virsh -c qemu:///system list --all >/dev/null 2>&1; then warn 'libvirt qemu:///system is not ready; run sudo bash check.sh for diagnostics.'; fi
+else
+  log 'Control VM is remote-only. Verify the Singapore node using bot.py --self-check after `-node create` is complete.'
+fi
 ROLLBACK_ARMED=0
 printf '\n%b════════════════════ INSTALLATION COMPLETE ════════════════════%b\n' "$GRN" "$NC"
 log 'Power By RGNODES™ — setup completed. Existing .env, database, VM disks, metadata and backups were preserved.'
